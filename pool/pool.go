@@ -38,7 +38,7 @@ func (p *Pool[T]) Get() (*T, error) {
 		return resource, nil
 	}
 
-	return nil, errors.New("can get more resource")
+	return nil, errors.New("cannot get more resource")
 }
 
 func (p *Pool[T]) Release(resource *T) error {
