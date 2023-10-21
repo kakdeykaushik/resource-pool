@@ -26,3 +26,5 @@ temp
 .vscode
 .env
 
+
+*.sqlite3
