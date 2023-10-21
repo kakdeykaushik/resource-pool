@@ -4,16 +4,20 @@ import (
 	"errors"
 )
 
-// todo: test resource
-type Pool[T any] struct {
-	idle     []*T
-	occupied []*T
-	capacity uint8
-	create   func() (*T, error) // todo: better
+type Resourcer[T any] interface {
+	Create() (*T, error)
+	Reset() error
 }
 
-func NewPool[T any](capacity uint8, create func() (*T, error)) *Pool[T] {
-	return &Pool[T]{[]*T{}, []*T{}, capacity, create}
+type Pool[T any] struct {
+	idle      []*T
+	occupied  []*T
+	capacity  uint8
+	resourcer Resourcer[T]
+}
+
+func NewPool[T any](capacity uint8, r Resourcer[T]) *Pool[T] {
+	return &Pool[T]{[]*T{}, []*T{}, capacity, r}
 }
 
 func (p *Pool[T]) Get() (*T, error) {
@@ -26,7 +30,7 @@ func (p *Pool[T]) Get() (*T, error) {
 	}
 
 	if len(p.occupied) < int(p.capacity) {
-		resource, err := p.create()
+		resource, err := p.resourcer.Create()
 		if err != nil {
 			return nil, err
 		}
@@ -43,6 +47,10 @@ func (p *Pool[T]) Release(resource *T) error {
 		return errors.New("not found")
 	}
 
+	if err := p.resourcer.Reset(); err != nil {
+		return err
+	}
+
 	p.occupied = append(p.occupied[:idx], p.occupied[idx+1:]...)
 	p.idle = append(p.idle, resource)
 	return nil
@@ -50,7 +58,6 @@ func (p *Pool[T]) Release(resource *T) error {
 
 func getIdx[T any](slice []*T, target *T) int {
 	for idx, v := range slice {
-		// todo: check this
 		if target == v {
 			return idx
 		}
