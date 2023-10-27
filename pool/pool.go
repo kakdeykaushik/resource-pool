@@ -2,6 +2,7 @@ package pool
 
 import (
 	"errors"
+	"sync"
 )
 
 type Resourcer[T any] interface {
@@ -14,13 +15,16 @@ type Pool[T any] struct {
 	occupied  []*T
 	capacity  uint8
 	resourcer Resourcer[T]
+	mu        sync.Mutex
 }
 
 func NewPool[T any](capacity uint8, r Resourcer[T]) *Pool[T] {
-	return &Pool[T]{[]*T{}, []*T{}, capacity, r}
+	return &Pool[T]{[]*T{}, []*T{}, capacity, r, sync.Mutex{}}
 }
 
 func (p *Pool[T]) Get() (*T, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	if len(p.idle) > 0 {
 		resource := p.idle[0]
@@ -42,6 +46,9 @@ func (p *Pool[T]) Get() (*T, error) {
 }
 
 func (p *Pool[T]) Release(resource *T) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	idx := getIdx[T](p.occupied, resource)
 	if idx == -1 {
 		return errors.New("not found")

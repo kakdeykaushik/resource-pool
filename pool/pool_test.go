@@ -23,8 +23,8 @@ func TestGet(t *testing.T) {
 
 	// Test case: Trying to get more resources than the capacity
 	_, err = p.Get()
-	if err == nil || err.Error() != "can get more resource" {
-		t.Errorf("Expected 'can get more resource' error, got %v", err)
+	if err == nil || err.Error() != "cannot get more resource" {
+		t.Errorf("Expected 'cannot get more resource' error, got %v", err)
 	}
 }
 
