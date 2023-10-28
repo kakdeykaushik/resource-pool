@@ -3,71 +3,80 @@ package pool
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 )
 
 type Resourcer[T any] interface {
 	Create() (*T, error)
-	Reset() error
+	Reset(*T) error
 }
 
 type Pool[T any] struct {
-	idle      []*T
-	occupied  []*T
-	capacity  uint8
-	resourcer Resourcer[T]
-	mu        sync.Mutex
+	idle       chan *T
+	capacity   uint32
+	overflow   uint32
+	currResCnt uint64
+	resourcer  Resourcer[T]
+	mu         sync.Mutex
 }
 
-func NewPool[T any](capacity uint8, r Resourcer[T]) *Pool[T] {
-	return &Pool[T]{[]*T{}, []*T{}, capacity, r, sync.Mutex{}}
+func NewPool[T any](capacity uint32, overflow uint32, r Resourcer[T]) *Pool[T] {
+	resources := make(chan *T, capacity+overflow)
+	resCnt := uint64(0)
+	var wg sync.WaitGroup
+
+	wg.Add(int(capacity))
+	for i := 0; i < int(capacity); i++ {
+		go func() {
+			defer wg.Done()
+			res, err := r.Create()
+			if err != nil {
+				return
+			}
+			atomic.AddUint64(&resCnt, 1)
+			resources <- res
+		}()
+	}
+
+	wg.Wait()
+	return &Pool[T]{resources, capacity, overflow, resCnt, r, sync.Mutex{}}
 }
 
 func (p *Pool[T]) Get() (*T, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
-	if len(p.idle) > 0 {
-		resource := p.idle[0]
-		p.idle = p.idle[1:]
-		p.occupied = append(p.occupied, resource)
-		return resource, nil
-	}
-
-	if len(p.occupied) < int(p.capacity) {
-		resource, err := p.resourcer.Create()
+	if len(p.idle) == 0 && atomic.LoadUint64(&p.currResCnt) < uint64(p.capacity)+uint64(p.overflow) {
+		res, err := p.resourcer.Create()
 		if err != nil {
-			return nil, err
+			return nil, errors.New("could not get resource")
 		}
-		p.occupied = append(p.occupied, resource)
-		return resource, nil
+		atomic.AddUint64(&p.currResCnt, 1)
+		p.idle <- res
 	}
 
-	return nil, errors.New("cannot get more resource")
+	switch len(p.idle) {
+	case 0:
+		return nil, errors.New("could not get resource")
+	default:
+		r := <-p.idle
+		return r, nil
+	}
 }
 
 func (p *Pool[T]) Release(resource *T) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
-	idx := getIdx[T](p.occupied, resource)
-	if idx == -1 {
-		return errors.New("not found")
-	}
-
-	if err := p.resourcer.Reset(); err != nil {
+	err := p.resourcer.Reset(resource)
+	if err != nil {
 		return err
 	}
 
-	p.occupied = append(p.occupied[:idx], p.occupied[idx+1:]...)
-	p.idle = append(p.idle, resource)
-	return nil
-}
-
-func getIdx[T any](slice []*T, target *T) int {
-	for idx, v := range slice {
-		if target == v {
-			return idx
-		}
+	if len(p.idle) < int(p.capacity) {
+		p.idle <- resource
+		return nil
 	}
-	return -1
+
+	atomic.AddUint64(&p.currResCnt, ^uint64(0))
+	// cannot put it in pool, so resource should be destroyed
+	// Go being GC language we cannot delete the object, GC will take care of it
+	// todo: re check this, you might have learnt something in time being
+	return nil
 }
