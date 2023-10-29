@@ -4,6 +4,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type Resourcer[T any] interface {
@@ -14,15 +15,15 @@ type Resourcer[T any] interface {
 type Pool[T any] struct {
 	idle       chan *T
 	capacity   uint32
-	overflow   uint32
 	currResCnt uint64
 	resourcer  Resourcer[T]
-	mu         sync.Mutex
+	// mu         sync.Mutex
+	waitTime time.Duration
 }
 
-func NewPool[T any](capacity uint32, overflow uint32, r Resourcer[T]) *Pool[T] {
-	resources := make(chan *T, capacity+overflow)
-	resCnt := uint64(0)
+func spinRes[T any](capacity uint32, r Resourcer[T]) (chan *T, uint64) {
+	resources := make(chan *T, capacity)
+	var resCnt uint64 = 0
 	var wg sync.WaitGroup
 
 	wg.Add(int(capacity))
@@ -39,27 +40,48 @@ func NewPool[T any](capacity uint32, overflow uint32, r Resourcer[T]) *Pool[T] {
 	}
 
 	wg.Wait()
-	return &Pool[T]{resources, capacity, overflow, resCnt, r, sync.Mutex{}}
+	return resources, resCnt
+}
+
+func NewPool[T any](capacity uint32, r Resourcer[T]) *Pool[T] {
+	resources, resCnt := spinRes[T](capacity, r)
+	return &Pool[T]{resources, capacity, resCnt, r, 0}
+}
+
+func NewWaitPool[T any](capacity uint32, r Resourcer[T], waitTime time.Duration) *Pool[T] {
+	resources, resCnt := spinRes[T](capacity, r)
+	return &Pool[T]{resources, capacity, resCnt, r, waitTime}
+}
+
+func (p *Pool[T]) isFull() bool {
+	return atomic.LoadUint64(&p.currResCnt) >= uint64(p.capacity)
 }
 
 func (p *Pool[T]) Get() (*T, error) {
 
-	if len(p.idle) == 0 && atomic.LoadUint64(&p.currResCnt) < uint64(p.capacity)+uint64(p.overflow) {
+	// edge case
+	if len(p.idle) == 0 && (!p.isFull()) {
 		res, err := p.resourcer.Create()
-		if err != nil {
-			return nil, errors.New("could not get resource")
+		if err == nil && res != nil {
+			atomic.AddUint64(&p.currResCnt, 1)
+			p.idle <- res
 		}
-		atomic.AddUint64(&p.currResCnt, 1)
-		p.idle <- res
 	}
 
-	switch len(p.idle) {
-	case 0:
-		return nil, errors.New("could not get resource")
-	default:
-		r := <-p.idle
-		return r, nil
+	if len(p.idle) == 0 {
+		select {
+		case <-time.After(p.waitTime):
+			return nil, errors.New("could not get resource")
+		case r := <-p.idle:
+			return r, nil
+		}
 	}
+
+	// possibility of bug here ?
+	// for a non-waiting Pool, if idle channel has 1 resource and
+	// 2 concurrent instructions reaches this line of code then 1 of them have
+	// to wait until resource is being put back into Pool
+	return <-p.idle, nil
 }
 
 func (p *Pool[T]) Release(resource *T) error {
@@ -69,14 +91,6 @@ func (p *Pool[T]) Release(resource *T) error {
 		return err
 	}
 
-	if len(p.idle) < int(p.capacity) {
-		p.idle <- resource
-		return nil
-	}
-
-	atomic.AddUint64(&p.currResCnt, ^uint64(0))
-	// cannot put it in pool, so resource should be destroyed
-	// Go being GC language we cannot delete the object, GC will take care of it
-	// todo: re check this, you might have learnt something in time being
+	p.idle <- resource
 	return nil
 }
