@@ -3,71 +3,94 @@ package pool
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type Resourcer[T any] interface {
 	Create() (*T, error)
-	Reset() error
+	Reset(*T) error
 }
 
 type Pool[T any] struct {
-	idle      []*T
-	occupied  []*T
-	capacity  uint8
-	resourcer Resourcer[T]
-	mu        sync.Mutex
+	idle       chan *T
+	capacity   uint32
+	currResCnt uint64
+	resourcer  Resourcer[T]
+	// mu         sync.Mutex
+	waitTime time.Duration
 }
 
-func NewPool[T any](capacity uint8, r Resourcer[T]) *Pool[T] {
-	return &Pool[T]{[]*T{}, []*T{}, capacity, r, sync.Mutex{}}
+func spinRes[T any](capacity uint32, r Resourcer[T]) (chan *T, uint64) {
+	resources := make(chan *T, capacity)
+	var resCnt uint64 = 0
+	var wg sync.WaitGroup
+
+	wg.Add(int(capacity))
+	for i := 0; i < int(capacity); i++ {
+		go func() {
+			defer wg.Done()
+			res, err := r.Create()
+			if err != nil {
+				return
+			}
+			atomic.AddUint64(&resCnt, 1)
+			resources <- res
+		}()
+	}
+
+	wg.Wait()
+	return resources, resCnt
+}
+
+func NewPool[T any](capacity uint32, r Resourcer[T]) *Pool[T] {
+	resources, resCnt := spinRes[T](capacity, r)
+	return &Pool[T]{resources, capacity, resCnt, r, 0}
+}
+
+func NewWaitPool[T any](capacity uint32, r Resourcer[T], waitTime time.Duration) *Pool[T] {
+	resources, resCnt := spinRes[T](capacity, r)
+	return &Pool[T]{resources, capacity, resCnt, r, waitTime}
+}
+
+func (p *Pool[T]) isFull() bool {
+	return atomic.LoadUint64(&p.currResCnt) >= uint64(p.capacity)
 }
 
 func (p *Pool[T]) Get() (*T, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
-	if len(p.idle) > 0 {
-		resource := p.idle[0]
-		p.idle = p.idle[1:]
-		p.occupied = append(p.occupied, resource)
-		return resource, nil
-	}
-
-	if len(p.occupied) < int(p.capacity) {
-		resource, err := p.resourcer.Create()
-		if err != nil {
-			return nil, err
+	// edge case
+	if len(p.idle) == 0 && (!p.isFull()) {
+		res, err := p.resourcer.Create()
+		if err == nil && res != nil {
+			atomic.AddUint64(&p.currResCnt, 1)
+			p.idle <- res
 		}
-		p.occupied = append(p.occupied, resource)
-		return resource, nil
 	}
 
-	return nil, errors.New("cannot get more resource")
+	if len(p.idle) == 0 {
+		select {
+		case <-time.After(p.waitTime):
+			return nil, errors.New("could not get resource")
+		case r := <-p.idle:
+			return r, nil
+		}
+	}
+
+	// possibility of bug here ?
+	// for a non-waiting Pool, if idle channel has 1 resource and
+	// 2 concurrent instructions reaches this line of code then 1 of them have
+	// to wait until resource is being put back into Pool
+	return <-p.idle, nil
 }
 
 func (p *Pool[T]) Release(resource *T) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
-	idx := getIdx[T](p.occupied, resource)
-	if idx == -1 {
-		return errors.New("not found")
-	}
-
-	if err := p.resourcer.Reset(); err != nil {
+	err := p.resourcer.Reset(resource)
+	if err != nil {
 		return err
 	}
 
-	p.occupied = append(p.occupied[:idx], p.occupied[idx+1:]...)
-	p.idle = append(p.idle, resource)
+	p.idle <- resource
 	return nil
-}
-
-func getIdx[T any](slice []*T, target *T) int {
-	for idx, v := range slice {
-		if target == v {
-			return idx
-		}
-	}
-	return -1
 }
